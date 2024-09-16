@@ -96,6 +96,7 @@
   10. Interval 5 Timeout 5 Start period 30 Retries 3.
   11. Create.
 - Copy JSON of this task defi. file we are require this file for codepipeline.
+- Create file in the root of your code: `taskdef-stag/prod.json`
 - Remove image name form this task and replace with:
   ```
   image": "<IMAGE1_NAME>",
@@ -104,3 +105,92 @@
   ```
   "tags": []
   ```
+- Here we are done with TASK DEF. Let's create cluster.
+## Cluster and service.
+- Go to ECS and create ECS cluster with `FARGATE` capacity provider.
+- Create security group with HTTP and HTTPs inbound. Add another inbound where all tcp allowed from that security group itself.
+- Create service -> Capacity provider strategy, FARGATE 0 1.
+- Application type: Service, Family: Task Definition, Service type: replica, Deployment type: Blue/Green. (Create codedeploy role for ECS)
+- Netwroking: Select VPC, Choose public subnets only (atleast 2), Select security group that created + RDS ec2-rds security group, Public IP on.
+- Loadbalancer: application, Container: directus, Healthcheck: 30, listener 443, target group, blue/green, http, http, /server/ping.
+- create. (If everything is alright then your container should be up and running in no time.
+- **PLease make sure you make Directus evn varibale `host=0.0.0.0` if it is set to localhost then load balancer will fail in health check.**
+## CodeBuild Set up.
+- Create one codebuild IAM role with `EC2InstanceProfileForImageBuilderECRContainerBuilds` policy.
+- Create Codebuild, Select Service role(enable upadate role option), source: none, Select Compute and other reosurce.
+- Set environement variable:
+  ```
+  AWS_DEFAULT_REGION=us-east-1
+  ECR_REPOSITORY_URI=imageuri
+  ```
+- Create Buildspec:
+  ```
+  version: 0.2
+  phases:
+    pre_build:
+      commands:
+        - echo Logging in to Amazon ECR...
+        - aws --version
+        - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI
+        - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+        - IMAGE_TAG=${COMMIT_HASH:=latest}
+    build:
+      commands:
+        - echo Build started on `date`
+        - echo set version and release date
+        - echo "$COMMIT_HASH | `date`" > version.txt
+        - echo Building the Docker image...
+        - docker build -t directus .
+        - docker tag directus $ECR_REPOSITORY_URI:$IMAGE_TAG
+        - docker tag directus $ECR_REPOSITORY_URI:latest
+    post_build:
+      commands:
+        - echo Build started on `date`
+        - echo Pushing the Docker images...
+        - docker push $ECR_REPOSITORY_URI:latest
+        - docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
+        - printf '{"Name":"directus","ImageURI":"%s:%s"}' $ECR_REPOSITORY_URI $IMAGE_TAG > imageDetail.json
+        - cat imageDetail.json
+        - echo Build completed on `date`
+  artifacts:
+    files: 
+      - 'image*.json'
+      - 'appspec.yaml'
+      - 'taskdef-stag.json'
+      - 'taskdef-prod.json'
+    secondary-artifacts:
+      DefinitionArtifact:
+        files:
+          - appspec.yaml
+          - taskdef.json
+          - imageDetail.json
+      ImageArtifact:
+        files:
+          - imageDetail.json
+  ```
+- Create CodeBuild.
+## CodeDeploy and Appspec.
+- Go to codedeploy applications, you will find codedeploy created by ECS. edit deployment group. Set Original revision termination to 5 min.
+- Create `appspec.yaml` file at root of the code.
+  ```
+  version: 0.0
+  Resources:
+    - TargetService:
+        Type: AWS::ECS::Service
+        Properties:
+          TaskDefinition: <TASK_DEFINITION>
+          LoadBalancerInfo:
+            ContainerName: "directus" # copy from task definition under containerDefinitions.name
+            ContainerPort: 8055 # an application container port
+  ```
+## CodePipeline.
+- Create pipeline, Choose source accourding to your need.
+- Select CodeBuild that created as build stage.
+- Create pipeline.
+- Edit pipeline and create stage, from service choose `Amazone ECS (Blue/Green)`.
+- Choose codedeploy application for your project.
+- source:buildartifact, TaskDefinitionTemplateArtifact:BuildArtifact, TaskDefinitionTemplatePath:taskdef-stag.json
+- Image1ArtifactName:BuildArtifact, Image1ContainerName: IMAGE1_NAME.
+- AppSpecTemplateArtifact: BuildArtifact, keep name as it is.
+- Variable namespace: DeployVariables.
+- we are done. Release the changes and check if everything is getting success or not.
